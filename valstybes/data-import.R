@@ -5,8 +5,7 @@ library(XML)
 library(jsonlite)
 library(R.cache)
 library(testit)
-
-dataflow_url <- 'https://osp-rs.stat.gov.lt/rest_xml/dataflow/'
+library(hash)
 
 get_names_dataflow <- function(
   dataflow_url,
@@ -60,7 +59,8 @@ get_indicator_index <- function(
   dataflow,
   indicator_name,
   namespaces = NA
-) {
+)
+{
   # Get the names and indices
   ids_names <- get_names_dataflow('https://osp-rs.stat.gov.lt/rest_xml/dataflow/')
   names <- ids_names$names
@@ -91,16 +91,20 @@ get_indicator <- function(
     data_url,
     index
 ) {
-  sample <- GET('https://osp-rs.stat.gov.lt/rest_xml/data/S1R102_M8020102')$content %>% 
-    rawToChar()
-  
-  sample_xml <- sample %>% 
+  xml_data <- GET(paste0(data_url, 'data/', index))$content %>% 
+    rawToChar() %>% 
     xmlTreeParse(useInternalNodes = TRUE) %>% 
     xmlRoot()
   
-  namespaces <- xmlNamespaceDefinitions(sample_xml, simplify = TRUE) 
+  namespaces <- xmlNamespaceDefinitions(xml_data, simplify = TRUE) 
   
-  return( list(data=sample_xml, namespaces=namespaces) )
+  struct_code <- xpathApply(
+    xml_data, "//*/mes:DataSet", namespaces = namespaces
+  )
+  struct_code <- xmlGetAttr(struct_code[[1]], "structureRef")
+  struct_url <- paste0(data_url, 'datastructure/LSD/', struct_code)
+  
+  return( list(data=xml_data, namespaces=namespaces, struct_url=struct_url) )
 }
 
 parse_observation <- function(
@@ -132,7 +136,8 @@ parse_observation <- function(
 get_dimension_names <- function(
     sample_node,
     namespaces
-) {
+)
+{
   names <- xpathApply(sample_node,
                       "g:ObsKey/g:Value",
                       namespaces = namespaces)
@@ -142,16 +147,66 @@ get_dimension_names <- function(
   return(dim_names)
 }
 
-get_df_encoded <- function(
+
+get_codelists <- function(
+    xml_data, 
+    struct_url, 
+    dim_names
+)
+{
+  codelists <- hash()
+  
+  xml_meta <- GET(struct_url)$content %>% 
+    rawToChar() %>% 
+    xmlTreeParse(useInternalNodes = TRUE) %>% 
+    xmlRoot()
+  
+  struct_ns <- xmlNamespaceDefinitions(xml_meta, simplify = TRUE)
+  
+  for(dim_name in dim_names) {
+    codelists[[dim_name]] <- hash()
+    
+    xpath <- paste0( "//*/str:Codelist[@id='", dim_name, "']/str:Code")
+    codes <- xpathApply(xml_meta, xpath,
+                          namespaces = struct_ns)
+    
+    for(code in codes) {
+      code_name <- xmlGetAttr(code, "id")
+      
+      code_value <- xpathApply(code, 
+                               "com:Name[@xml:lang='en']", 
+                               namespaces = struct_ns)
+
+      codelists[[dim_name]][[code_name]] <- xmlValue(code_value)
+    }
+  }
+  
+  return (codelists)
+}
+
+get_dataframe <- function(
     data_url,
     index
 ) {
+  dataflow_url_name <- gsub("(https?://)([^/]+)", "\\2", data_url)
+  data_url_name <- paste0(dataflow_url_name, index)
+  key_list <- list(data_url_name)
+  
+  # If the data set is already in R cache, use that
+  data <- loadCache(key=key_list)
+  if(len(data) != 0) {
+    return (data) 
+  }
+  
+  # Import the indicator
   indicator <- get_indicator(data_url, index)
   
   data <- indicator$data
   namespaces <- indicator$namespaces
+  struct_url <- indicator$struct_url
   
-  observations <- xpathApply(sample_xml,
+  # Get observations and their names
+  observations <- xpathApply(data,
                              "//*/g:Obs",
                              namespaces = namespaces
   )
@@ -159,13 +214,31 @@ get_df_encoded <- function(
   dims <- get_dimension_names(observations[[1]], namespaces)
   dims <- c(dims, "value")
   
+  codelists <- get_codelists(data, 
+                             struct_url, 
+                             dims[1:length(dims)-1])
+  
+  # Parse observations
+  obs_parsed <- lapply(observations, 
+                  function(x) parse_observation(x, dims, namespaces))
+  
   df <- data.frame(
-    do.call("rbind", obs_parsed)) # Need to use do.call as opose to rbind itself
+    do.call("rbind", obs_parsed)) # Need to use do.call as oppose to rbind itself
   colnames(df) <- dims
+  
+  for(dim in dims) {
+    # If there is no provided code lists, skip
+    if( length(codelists[[dim]]) == 0) { next }
+    # Map the values, using the hashmap
+    df[[dim]] <- sapply( df[[dim]], function(x) codelists[[dim]][[x]] )
+  }
+  
+  # Cache the data set
+  saveCache(df, key=key_list)
   
   return(df)
 }
 
-# TODO: get codelists
+df <- get_dataframe('https://osp-rs.stat.gov.lt/rest_xml/', 'S3R629_M3010217')
+head(df)
 
-get_codelists <- function(x) {}
